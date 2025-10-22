@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from enum import Enum
 from functools import partial, wraps
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Optional, TypeVar, Union, get_type_hints
 from zipfile import is_zipfile
 
@@ -150,6 +150,9 @@ else:
 
 
 logger = logging.get_logger(__name__)
+
+# Lock to prevent race conditions when multiple threads load from the same safetensors file
+_safetensors_file_lock = Lock()
 
 XLA_USE_BF16 = os.environ.get("XLA_USE_BF16", "0").upper()
 XLA_DOWNCAST_BF16 = os.environ.get("XLA_DOWNCAST_BF16", "0").upper()
@@ -399,20 +402,21 @@ def load_state_dict(
     """
     # Use safetensors if possible
     if checkpoint_file.endswith(".safetensors"):
-        with safe_open(checkpoint_file, framework="pt") as f:
-            state_dict = {}
-            for k in f.keys():
-                if map_location == "meta":
-                    _slice = f.get_slice(k)
-                    k_dtype = _slice.get_dtype()
-                    if k_dtype in str_to_torch_dtype:
-                        dtype = str_to_torch_dtype[k_dtype]
+        with _safetensors_file_lock:
+            with safe_open(checkpoint_file, framework="pt") as f:
+                state_dict = {}
+                for k in f.keys():
+                    if map_location == "meta":
+                        _slice = f.get_slice(k)
+                        k_dtype = _slice.get_dtype()
+                        if k_dtype in str_to_torch_dtype:
+                            dtype = str_to_torch_dtype[k_dtype]
+                        else:
+                            raise ValueError(f"Cannot load safetensors of unknown dtype {k_dtype}")
+                        state_dict[k] = torch.empty(size=_slice.get_shape(), dtype=dtype, device="meta")
                     else:
-                        raise ValueError(f"Cannot load safetensors of unknown dtype {k_dtype}")
-                    state_dict[k] = torch.empty(size=_slice.get_shape(), dtype=dtype, device="meta")
-                else:
-                    state_dict[k] = f.get_tensor(k)
-            return state_dict
+                        state_dict[k] = f.get_tensor(k)
+                return state_dict
 
     # Fallback to torch.load (if weights_only was explicitly False, do not check safety as this is known to be unsafe)
     if weights_only:
@@ -597,103 +601,110 @@ def _load_state_dict_into_meta_model(
     is_quantized = hf_quantizer is not None
     is_safetensors = shard_file.endswith(".safetensors")
     is_meta_state_dict = is_safetensors
-    file_pointer = safe_open(shard_file, framework="pt", device=tensor_device) if is_meta_state_dict else None
-    params_to_load = list(state_dict.keys())
+    # Use a lock when opening safetensors files to prevent race conditions in multithreaded scenarios
+    if is_meta_state_dict:
+        _safetensors_file_lock.acquire()
+    try:
+        file_pointer = safe_open(shard_file, framework="pt", device=tensor_device) if is_meta_state_dict else None
+        params_to_load = list(state_dict.keys())
 
-    for param_name in params_to_load:
-        empty_param = state_dict[param_name]
-        # we need to use serialized_param_name as file pointer is untouched
-        if is_meta_state_dict:
-            # This is the name of the parameter as it appears on disk file
-            serialized_param_name = reverse_renaming_mapping[param_name]
-            param = file_pointer.get_slice(serialized_param_name)
-        else:
-            param = empty_param.to(tensor_device)  # It is actually not empty!
-        to_contiguous, casting_dtype = _infer_parameter_dtype(model, param_name, empty_param, hf_quantizer)
-
-        if device_mesh is not None:
-            if not is_quantized or not hf_quantizer.param_needs_quantization(model, param_name):
-                # In this case, the param is already on the correct device!
-                shard_and_distribute_module(
-                    model,
-                    param,
-                    empty_param,
-                    param_name,
-                    casting_dtype,
-                    to_contiguous,
-                    device_mesh.get_local_rank(),
-                    device_mesh,
-                )
+        for param_name in params_to_load:
+            empty_param = state_dict[param_name]
+            # we need to use serialized_param_name as file pointer is untouched
+            if is_meta_state_dict:
+                # This is the name of the parameter as it appears on disk file
+                serialized_param_name = reverse_renaming_mapping[param_name]
+                param = file_pointer.get_slice(serialized_param_name)
             else:
-                # we have a device mesh but the param needs to be quantized, so we shard inside create_quantized_param
-                sharding_kwargs = {
-                    "empty_param": empty_param,
-                    "casting_dtype": casting_dtype,
-                    "to_contiguous": to_contiguous,
-                    "rank": device_mesh.get_local_rank(),
-                    "device_mesh": device_mesh,
-                }
-                hf_quantizer.create_quantized_param(
-                    model,
-                    param,
-                    param_name,
-                    device_mesh.get_local_rank(),
-                    **sharding_kwargs,
-                )
-        else:
-            param = param[...]
-            if casting_dtype is not None:
-                param = param.to(casting_dtype)
-            if to_contiguous:
-                param = param.contiguous()
+                param = empty_param.to(tensor_device)  # It is actually not empty!
+            to_contiguous, casting_dtype = _infer_parameter_dtype(model, param_name, empty_param, hf_quantizer)
 
-            if device_map is None:
-                param_device = "cpu"
-            else:
-                module_layer = re.search(device_map_regex, param_name)
-                if not module_layer:
-                    raise ValueError(f"{param_name} doesn't have any device set.")
+            if device_mesh is not None:
+                if not is_quantized or not hf_quantizer.param_needs_quantization(model, param_name):
+                    # In this case, the param is already on the correct device!
+                    shard_and_distribute_module(
+                        model,
+                        param,
+                        empty_param,
+                        param_name,
+                        casting_dtype,
+                        to_contiguous,
+                        device_mesh.get_local_rank(),
+                        device_mesh,
+                    )
                 else:
-                    param_device = device_map[module_layer.group()]
-
-            if param_device == "disk":
-                if not is_safetensors:
-                    disk_offload_index = offload_weight(param, param_name, disk_offload_folder, disk_offload_index)
-            elif not is_quantized or not hf_quantizer.param_needs_quantization(model, param_name):
-                if is_fsdp_enabled():
-                    param_device = "cpu" if is_local_dist_rank_0() else "meta"
-
-                _load_parameter_into_model(model, param_name, param.to(param_device))
-
+                    # we have a device mesh but the param needs to be quantized, so we shard inside create_quantized_param
+                    sharding_kwargs = {
+                        "empty_param": empty_param,
+                        "casting_dtype": casting_dtype,
+                        "to_contiguous": to_contiguous,
+                        "rank": device_mesh.get_local_rank(),
+                        "device_mesh": device_mesh,
+                    }
+                    hf_quantizer.create_quantized_param(
+                        model,
+                        param,
+                        param_name,
+                        device_mesh.get_local_rank(),
+                        **sharding_kwargs,
+                    )
             else:
-                # TODO naming is stupid it loads it as well
-                hf_quantizer.create_quantized_param(model, param, param_name, param_device)
+                param = param[...]
+                if casting_dtype is not None:
+                    param = param.to(casting_dtype)
+                if to_contiguous:
+                    param = param.contiguous()
 
-                # For quantized modules with FSDP/DeepSpeed Stage 3, we need to quantize the parameter on the GPU
-                # and then cast it to CPU to avoid excessive memory usage on each GPU
-                # in comparison to the sharded model across GPUs.
-                if is_fsdp_enabled() or is_deepspeed_zero3_enabled():
-                    param_name = hf_quantizer.get_param_name(param_name)
-                    module, param_type = get_module_from_name(model, param_name)
-                    value = getattr(module, param_type)
-                    # We need to wait until the quantized value is created
-                    if value.device.type == "meta":
-                        continue
-                    val_kwargs = value.__dict__
-                    if not value.is_floating_point():
-                        val_kwargs["requires_grad"] = False
-                    device = "meta" if is_fsdp_enabled() and not is_local_dist_rank_0() else "cpu"
-                    value = type(value)(value.data.to(device), **val_kwargs)
-                    setattr(module, param_type, value)
+                if device_map is None:
+                    param_device = "cpu"
+                else:
+                    module_layer = re.search(device_map_regex, param_name)
+                    if not module_layer:
+                        raise ValueError(f"{param_name} doesn't have any device set.")
+                    else:
+                        param_device = device_map[module_layer.group()]
 
-        # Remove the param from the state dict if it was not loaded on the fly to avoid wasting memory
-        if not is_meta_state_dict:
-            del state_dict[param_name]
+                if param_device == "disk":
+                    if not is_safetensors:
+                        disk_offload_index = offload_weight(param, param_name, disk_offload_folder, disk_offload_index)
+                elif not is_quantized or not hf_quantizer.param_needs_quantization(model, param_name):
+                    if is_fsdp_enabled():
+                        param_device = "cpu" if is_local_dist_rank_0() else "meta"
 
-    if file_pointer is not None:
-        file_pointer.__exit__(None, None, None)
+                    _load_parameter_into_model(model, param_name, param.to(param_device))
 
-    return disk_offload_index
+                else:
+                    # TODO naming is stupid it loads it as well
+                    hf_quantizer.create_quantized_param(model, param, param_name, param_device)
+
+                    # For quantized modules with FSDP/DeepSpeed Stage 3, we need to quantize the parameter on the GPU
+                    # and then cast it to CPU to avoid excessive memory usage on each GPU
+                    # in comparison to the sharded model across GPUs.
+                    if is_fsdp_enabled() or is_deepspeed_zero3_enabled():
+                        param_name = hf_quantizer.get_param_name(param_name)
+                        module, param_type = get_module_from_name(model, param_name)
+                        value = getattr(module, param_type)
+                        # We need to wait until the quantized value is created
+                        if value.device.type == "meta":
+                            continue
+                        val_kwargs = value.__dict__
+                        if not value.is_floating_point():
+                            val_kwargs["requires_grad"] = False
+                        device = "meta" if is_fsdp_enabled() and not is_local_dist_rank_0() else "cpu"
+                        value = type(value)(value.data.to(device), **val_kwargs)
+                        setattr(module, param_type, value)
+
+            # Remove the param from the state dict if it was not loaded on the fly to avoid wasting memory
+            if not is_meta_state_dict:
+                del state_dict[param_name]
+
+        if file_pointer is not None:
+            file_pointer.__exit__(None, None, None)
+
+        return disk_offload_index
+    finally:
+        if is_meta_state_dict:
+            _safetensors_file_lock.release()
 
 
 def load_shard_file(args):
